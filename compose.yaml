@@ -1,0 +1,257 @@
+# This is a Docker Compose file that defines the services and their
+# configurations for the GoldenCare project.
+
+# The services include:
+#   - cube: a Cube.js service for analytics and data visualization
+#   - postgres: a PostgreSQL database for storing data
+#   - django: a Django web application for managing data
+#   - nginx: a web server for serving static files and reverse proxying the
+#     Django application
+#   - redis: a Redis database for storing session data and caching
+#   - ftp: an FTP server for transferring files
+#   - emqx: an MQTT broker for IoT devices
+#   - portainer: a container management and debugging UI
+#   - logspout: a logging service for aggregating logs
+
+# The volumes mount the following directories:
+#   - ./nginx: configurations for the Nginx web server
+#   - ./static: static files for the Django application
+#   - ./media: media files for the Django application
+#   - ./logs: logs for the Django application
+#   - ./emqx_data: data for the EMQX MQTT broker
+#   - ./emqx_log: logs for the EMQX MQTT broker
+#   - ./portainer_data: data for Portainer
+
+services:
+  cube:
+    image: cubejs/cube:latest
+    container_name: silver_watch_cube
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+      - "15432:15432"
+    environment:
+      - CUBEJS_DB_TYPE=postgres
+      - CUBEJS_DEV_MODE=true
+      - RUST_BACKTRACE=full
+      - CUBEJS_API_SECRET=${CUBEJS_API_SECRET}
+      - CUBEJS_DB_HOST=postgres
+      - CUBEJS_DB_NAME=${POSTGRES_DB}
+      - CUBEJS_DB_USER=${POSTGRES_USER}
+      - CUBEJS_DB_PASS=${POSTGRES_PASSWORD}
+      - CUBEJS_DB_PORT=5432
+      - CUBEJS_CACHE_AND_QUEUE_DRIVER=cubestore
+      - CUBEJS_TELEMETRY=false
+      - CUBEJS_LOG_LEVEL=trace
+      - DEBUG=cubejs-api:*,cubejs-client:*
+      - CUBEJS_EXTERNAL_DEFAULT=true
+    volumes:
+      - .:/cube/conf
+      - cube_store_data:/cube/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - silver-watch-backend-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/readiness"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+        window: 120s
+
+  postgres:
+    image: postgres:13
+    container_name: silver_watch_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    command: ["postgres", "-c", "shared_buffers=256MB", "-c", "work_mem=64MB", "-c", "log_statement=all", "-c", "log_min_duration_statement=0"]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - silver-watch-backend-network
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  django:
+    image: nrad8393/silver-watch-backend-django:latest
+    env_file:
+      - .env
+    environment:
+      - DEBUG=True
+      - PYTHONUNBUFFERED=1
+      - DJANGO_LOG_LEVEL=DEBUG
+      - PYTHONDONTWRITEBYTECODE=1
+    volumes:
+      - static_volume:/app/static
+      - media_volume:/app/media
+      - logs:/app/logs
+    ports:
+      - "8000:8000"
+      - "5678:5678"
+    command: python manage.py runserver 0.0.0.0:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - silver-watch-backend-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, sys, socket; s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.connect(('localhost', 8000)); s.close()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  nginx:
+    image: nginx:alpine
+    volumes:
+      - ./nginx:/etc/nginx/conf.d
+      - static_volume:/app/static
+      - media_volume:/app/media
+    ports:
+      - "80:80"
+    environment:
+      - NGINX_HOST=localhost
+      - NGINX_DEBUG=1
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    depends_on:
+      django:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - silver-watch-backend-network
+  redis:
+    image: redis:alpine
+    restart: always
+    command: ["redis-server", "--appendonly", "yes", "--loglevel", "debug"]
+    networks:
+      - silver-watch-backend-network
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  ftp:
+    image: fauria/vsftpd
+    environment:
+      - FTP_USER=${FTP_USER}
+      - FTP_PASS=${FTP_PASS}
+      - PASV_ADDRESS=${PASV_ADDRESS}
+      - PASV_MIN_PORT=21100
+      - PASV_MAX_PORT=21110
+      - FILE_OPEN_MODE=0666
+      - LOCAL_UMASK=022
+    ports:
+      - "20:20"
+      - "21:21"
+      - "21100-21110:21100-21110"
+    volumes:
+      - static_volume:/home/vsftpd/static
+      - media_volume:/home/vsftpd/media
+    networks:
+      - silver-watch-backend-network
+    healthcheck:
+      test: ["CMD", "netstat", "-tln", "|", "grep", ":21"]
+      interval: 20s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  pgbouncer:
+    image: edoburu/pgbouncer
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      POOL_MODE: transaction
+    depends_on:
+      - postgres
+
+  emqx:
+    image: emqx:latest
+    environment:
+      - EMQX_LISTENERS__TCP__DEFAULT__BIND=1883
+      - EMQX_ADMIN_USER=${EMQX_ADMIN_USER}
+      - EMQX_ADMIN_PASSWORD=${EMQX_ADMIN_PASSWORD}
+      - EMQX_LOADED_MODULES="[emqx_management, emqx_dashboard]"
+    ports:
+      - "18083:18083"
+      - "1883:1883"
+      - "8080:8080"
+    volumes:
+      - emqx_data:/opt/emqx/data
+      - emqx_log:/opt/emqx/log
+    networks:
+      - silver-watch-backend-network
+
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: silver_watch_portainer
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - portainer_data:/data
+    ports:
+      - "9000:9000"
+    networks:
+      - silver-watch-backend-network
+
+  logspout:
+    image: gliderlabs/logspout:latest
+    container_name: silver_watch_logs
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: syslog://logs.papertrailapp.com:55555
+    restart: unless-stopped
+    networks:
+      - silver-watch-backend-network
+
+volumes:
+  postgres_data:
+  static_volume:
+  media_volume:
+  logs:
+  emqx_data:
+  emqx_log:
+  cube_store_data:
+  portainer_data:
+
+networks:
+  silver-watch-backend-network:
+    driver: bridge
